@@ -1,81 +1,106 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, TFile, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import {
+	createDailyNote,
+	getDailyNoteSettings,
+} from "obsidian-daily-notes-interface";
+import { ITelegramBotPluginAPIv1 } from 'telegram_plugin_api';
 
-// Remember to rename these classes and interfaces!
+const moment = window.moment;
 
-interface MyPluginSettings {
-	mySetting: string;
+interface TelegramDailyLogsPluginSettings {
+	timestamp_format: string;
+	section_name: string;
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+const DEFAULT_SETTINGS: TelegramDailyLogsPluginSettings = {
+	timestamp_format: 'YYYY-MM-DD HH:mm:ss',
+	section_name: '# Лог'
 }
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+export default class TelegramDailyLogsPlugin extends Plugin {
+	settings: TelegramDailyLogsPluginSettings;
+	private is_listening_for_log_text: boolean = false;
+	private all_income_msg_to_daily_log: boolean = false;
+	private _bot_api: ITelegramBotPluginAPIv1;
+
+	async getDailyNote(): Promise<TFile> {
+		const { folder, format } = getDailyNoteSettings();
+		const date = moment();
+		const filename = `${folder}/${date.format(format)}.md`;
+		const daily_note_file = this.app.vault.getFileByPath(filename);
+		return daily_note_file != null ? daily_note_file : createDailyNote(date);
+	}
+
+	async addDailyLog(log_message: string) {
+		const f = await this.getDailyNote();
+		let content = await this.app.vault.read(f!);
+		const pattern = `${this.settings.section_name}\n`;
+		if (!content.contains(pattern)) {
+			content = content + "\n" + pattern;
+		}
+		const start_pos = content.indexOf(pattern);
+		const nextSectionStartIndex = content.indexOf("#", start_pos + 1);
+		const end_pos = nextSectionStartIndex !== -1 ? nextSectionStartIndex : content.length;
+		const log_section = content.slice(start_pos, end_pos);
+		const new_log_section = log_section + '\n' + log_message;
+		const new_content = content.slice(0, start_pos) + new_log_section + content.slice(end_pos);
+		await this.app.vault.modify(f!, new_content);
+		return f
+	}
 
 	async onload() {
 		await this.loadSettings();
+		this.addSettingTab(new TelegramDailyLogsSettingTab(this.app, this));
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+		this._bot_api = this.app.plugins.plugins['obsidian-telegram-bot-plugin'].getAPIv1();
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
-
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
+		this._bot_api.addCommandHandler("add_log_to_daily", async (processedBefore) => {
+			console.log("recieved cmd add_log_to_daily")
+			if (processedBefore || this.is_listening_for_log_text) {
+				return { processed: false, answer: null};
 			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
+			this.is_listening_for_log_text = true;
+			return { processed: true, answer: "Введите текст или отправьте файл" };
+		}, "daily-logs");
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
+		this._bot_api.addCommandHandler("toggle_income_to_daily_log", async (processedBefore) => {
+			console.log("recieved cmd toggle_income_to_daily_log")
+			if (processedBefore || this.is_listening_for_log_text) {
+				return { processed: false, answer: null};
+			}			
+			this.all_income_msg_to_daily_log = !this.all_income_msg_to_daily_log;
+			const on_off_str: string = this.all_income_msg_to_daily_log ? "Включен" : "Выключен";
+			return { processed: true, answer: on_off_str + " режим 'записывать все входящие сообщения в daily заметки'" };
+		}, "daily-logs");
+
+		this._bot_api.addTextHandler(async (text, _) => {
+			if (this.is_listening_for_log_text || this.all_income_msg_to_daily_log) {
+					const now = moment();					
+					const log_message = `${now.format('YYYY-MM-DD HH:mm:ss')}:\n${text}\n`;
+					const f = await this.addDailyLog(log_message); 
+					this.is_listening_for_log_text = false;
+					return { processed: false, answer: `Запись добавлена в ежедневную заметку (${f?.path})` };
+			}
+
+			return { processed: false, answer: null };
+		}, "daily-logs");
+
+		this._bot_api.addFileHandler(async (file, processedBefore, caption) => {
+			if (this.is_listening_for_log_text || this.all_income_msg_to_daily_log) {
+				const now = moment();
+				let log_message = `\n${now.format('YYYY-MM-DD HH:mm:ss')}:\n![[${file.name}]]\n`;
+				if (caption) {
+					log_message += `${caption}\n`
 				}
+				const f = await this.addDailyLog(log_message);
+				this.is_listening_for_log_text = false;
+				return { processed: false, answer: `Файл сохранен в ${file.name}, ссылка добавлена в ${f?.path}` };
 			}
-		});
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+			return { processed: false, answer: null };
+		}, "daily-logs");
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
 
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
 	}
 
 	onunload() {
@@ -91,26 +116,10 @@ export default class MyPlugin extends Plugin {
 	}
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
+class TelegramDailyLogsSettingTab extends PluginSettingTab {
+	plugin: TelegramDailyLogsPlugin;
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
-
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
-
-	constructor(app: App, plugin: MyPlugin) {
+	constructor(app: App, plugin: TelegramDailyLogsPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
@@ -121,13 +130,23 @@ class SampleSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
+			.setName('timestamp format')
+			.setDesc('Each log entry is accompanied by a timestamp, set the format of this timestamp')
 			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
+				.setPlaceholder('YYYY-MM-DD HH:mm:ss')
+				.setValue(this.plugin.settings.timestamp_format)
 				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
+					this.plugin.settings.timestamp_format = value;
+					await this.plugin.saveSettings();
+				}));
+		new Setting(containerEl)
+			.setName('section name')
+			.setDesc('The name of the section under which the log will be inserted')
+			.addText(text => text
+				.setPlaceholder('# Log')
+				.setValue(this.plugin.settings.section_name)
+				.onChange(async (value) => {
+					this.plugin.settings.section_name = value;
 					await this.plugin.saveSettings();
 				}));
 	}
