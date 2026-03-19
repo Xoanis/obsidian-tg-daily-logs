@@ -1,4 +1,4 @@
-import { App, TFile, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
 import {
 	createDailyNote,
 	getDailyNoteSettings,
@@ -6,6 +6,7 @@ import {
 import { ITelegramBotPluginAPIv1 } from 'telegram_plugin_api';
 
 const moment = window.moment;
+const PLUGIN_UNIT_NAME = 'daily-logs';
 
 interface TelegramDailyLogsPluginSettings {
 	timestamp_format: string;
@@ -51,17 +52,28 @@ export default class TelegramDailyLogsPlugin extends Plugin {
 	async onload() {
 		await this.loadSettings();
 		this.addSettingTab(new TelegramDailyLogsSettingTab(this.app, this));
+		// @ts-ignore - Telegram plugin may not exist
+		this._bot_api = this.app.plugins?.plugins?.['obsidian-telegram-bot-plugin']?.getAPIv1();
+		if (!this._bot_api) {
+			new Notice("obsidian-telegram-bot-plugin should be enabled!")
+			console.error("Can't get obsidian-telegram-bot-plugin api")
+			return;
+		}
 
-		this._bot_api = this.app.plugins.plugins['obsidian-telegram-bot-plugin'].getAPIv1();
-
-		this._bot_api.addCommandHandler("add_log_to_daily", async (processedBefore) => {
+		this._bot_api.addCommandHandler("add_log_to_daily", async (args: string, processedBefore) => {
 			console.log("recieved cmd add_log_to_daily")
 			if (processedBefore || this.is_listening_for_log_text) {
 				return { processed: false, answer: null};
 			}
+			if (args) {
+				const now = moment();
+				const log_message = `${now.format('YYYY-MM-DD HH:mm:ss')}:\n${args}\n`;
+				const f = await this.addDailyLog(log_message); 
+				return { processed: true, answer: `Запись добавлена в ежедневную заметку (${f?.path})` };
+			}
 			this.is_listening_for_log_text = true;
 			return { processed: true, answer: "Введите текст или отправьте файл" };
-		}, "daily-logs");
+		}, PLUGIN_UNIT_NAME);
 
 		this._bot_api.addCommandHandler("toggle_income_to_daily_log", async (processedBefore) => {
 			console.log("recieved cmd toggle_income_to_daily_log")
@@ -71,7 +83,7 @@ export default class TelegramDailyLogsPlugin extends Plugin {
 			this.all_income_msg_to_daily_log = !this.all_income_msg_to_daily_log;
 			const on_off_str: string = this.all_income_msg_to_daily_log ? "Включен" : "Выключен";
 			return { processed: true, answer: on_off_str + " режим 'записывать все входящие сообщения в daily заметки'" };
-		}, "daily-logs");
+		}, PLUGIN_UNIT_NAME);
 
 		this._bot_api.addTextHandler(async (text, _) => {
 			if (this.is_listening_for_log_text || this.all_income_msg_to_daily_log) {
@@ -83,7 +95,7 @@ export default class TelegramDailyLogsPlugin extends Plugin {
 			}
 
 			return { processed: false, answer: null };
-		}, "daily-logs");
+		}, PLUGIN_UNIT_NAME);
 
 		this._bot_api.addFileHandler(async (file, processedBefore, caption) => {
 			if (this.is_listening_for_log_text || this.all_income_msg_to_daily_log) {
@@ -98,13 +110,14 @@ export default class TelegramDailyLogsPlugin extends Plugin {
 			}
 
 			return { processed: false, answer: null };
-		}, "daily-logs");
+		}, PLUGIN_UNIT_NAME);
 
 
 	}
 
 	onunload() {
-
+		console.log("unloading plugin obsidian-tg-daily-logs")
+		this._bot_api.disposeHandlersForUnit(PLUGIN_UNIT_NAME);
 	}
 
 	async loadSettings() {
